@@ -33,14 +33,54 @@ occurrence_file <- "/home/vincent/Development/geospatial-analysis/Biodiversity-P
 aoi_file        <- "/home/vincent/Development/geospatial-analysis/Biodiversity-Project/Shared_Functions/GeoMeadian/outputs/Shapefiles/Kenya.shp"
 output_dir      <- "/home/vincent/Development/geospatial-analysis/Biodiversity-Project/Shared_Functions/GeoMeadian/outputs/Scenario_Comparison_Results"
 
-
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
 # ============================================================
 # 2. HELPER FUNCTIONS
 # ============================================================
 
-# Function to remove highly collinear variables (Strict r > 0.95 cutoff)
+# Helper to safely load and align rasters with mismatched extents/resolutions
+load_and_align_predictors <- function(raster_files) {
+  if (length(raster_files) == 1) {
+    return(terra::rast(raster_files))
+  }
+  
+  # Try loading all at once first (fastest if already matching)
+  r_try <- try(terra::rast(raster_files), silent = TRUE)
+  if (!inherits(r_try, "try-error")) {
+    return(r_try)
+  }
+  
+  cat("  Mismatch in extents/resolutions detected. Aligning and resampling layers...\n")
+  
+  # Load individually
+  r_list <- lapply(raster_files, terra::rast)
+  
+  # Find reference raster: pick the one with the highest spatial resolution (smallest cell size)
+  cell_sizes <- sapply(r_list, function(r) mean(terra::res(r)))
+  ref_idx <- which.min(cell_sizes)
+  ref <- r_list[[ref_idx]][[1]] # single-layer spatial template
+  
+  aligned_list <- list()
+  for (i in seq_along(r_list)) {
+    r <- r_list[[i]]
+    
+    # Check if geometry matches template grid
+    if (!terra::compareGeom(r, ref, lyrs = FALSE, crs = TRUE, ext = TRUE, rowcol = TRUE, stopOnError = FALSE)) {
+      # Reproject if CRS differs
+      if (terra::crs(r) != terra::crs(ref)) {
+        r <- terra::project(r, ref, method = "bilinear")
+      }
+      # Resample to match reference extent and grid resolution
+      r <- terra::resample(r, ref, method = "bilinear")
+    }
+    aligned_list[[i]] <- r
+  }
+  
+  return(terra::rast(aligned_list))
+}
+
+# Function to remove highly collinear variables (r > 0.95 cutoff)
 remove_correlated <- function(cor_mat, cutoff = 0.95){
   cor_mat[lower.tri(cor_mat, diag = TRUE)] <- NA
   remove <- c()
@@ -75,7 +115,6 @@ save_correlation_heatmap <- function(cor_mat, scen_name, save_path) {
     labs(title = paste0("Predictor Correlation Heatmap: ", scen_name),
          x = "", y = "")
   
-  # Dynamic plot sizing based on number of variables
   num_vars <- ncol(cor_mat)
   plot_dim <- max(6, min(16, num_vars * 0.55))
   
@@ -154,10 +193,11 @@ for (scen_name in names(scenarios)) {
     next
   }
   
-  predictors <- terra::rast(raster_files)
+  # Load and auto-align rasters across different resolutions/extents
+  predictors <- load_and_align_predictors(raster_files)
   names(predictors) <- make.names(names(predictors), unique = TRUE)
   
-  # Align CRS, crop, and mask to Kenya
+  # Align CRS, crop, and mask to Kenya AOI
   kenya_proj <- terra::project(kenya, predictors)
   predictors <- terra::crop(predictors, kenya_proj)
   predictors <- terra::mask(predictors, kenya_proj)
@@ -173,7 +213,7 @@ for (scen_name in names(scenarios)) {
   cat("Saving correlation matrix heatmap to:", cor_plot_file, "\n")
   save_correlation_heatmap(cor_mat, scen_name, cor_plot_file)
   
-  # Multicollinearity Removal (Strict r > 0.95 Threshold)
+  # Multicollinearity Removal (Strict 0.95 Threshold)
   cat("Removing collinear predictors (r > 0.95)...\n")
   drop_vars <- remove_correlated(cor_mat, cutoff = 0.95)
   
@@ -369,14 +409,14 @@ for(s_name in names(suitability_rasters)) {
 
 suit_stack <- terra::rast(aligned_rasters)
 
-# Calculate difference map (GeoMAD Indices vs TCI Climate if both available)
+# Calculate difference map (GeoMAD Indices vs TCI Climate if available)
 if("Suitability_GeoMAD_Indices" %in% names(suit_stack) && "Suitability_TCI_Climate" %in% names(suit_stack)) {
   diff_raster <- suit_stack[["Suitability_GeoMAD_Indices"]] - suit_stack[["Suitability_TCI_Climate"]]
   names(diff_raster) <- "Difference_GeoMAD_minus_TCI"
   terra::writeRaster(diff_raster, file.path(output_dir, "Difference_GeoMAD_vs_TCI.tif"), overwrite = TRUE)
 }
 
-# 4. Multi-Panel Suitability Map Grid (3x3 grid for 6 scenarios + difference map)
+# 4. Multi-Panel Suitability Map Grid
 png(file.path(output_dir, "Habitat_Suitability_Maps.png"), width = 1500, height = 1200, res = 150)
 par(mfrow = c(3, 3))
 
